@@ -185,6 +185,11 @@ public class BeeSemaphore {
                             return true;
                         }
                     }
+                    case STS_FAILED: {
+                        borrowerQueue.remove(borrower);
+                        if (isInterrupted) throw RequestInterruptException;
+                        return false;//timeout
+                    }
                 }
 
                 if (isFailed) {//failed
@@ -209,7 +214,7 @@ public class BeeSemaphore {
                             }
 
                             //reset to normal
-                            if (borrower.state == STS_WAITING) updater.compareAndSet(borrower, STS_WAITING, STS_NORMAL);
+                            if (borrower.state == STS_WAITING) updater.compareAndSet(borrower, STS_WAITING, isInterrupted?STS_FAILED :STS_NORMAL);
                         }
                     } else {//timeout
                         isFailed = true;
