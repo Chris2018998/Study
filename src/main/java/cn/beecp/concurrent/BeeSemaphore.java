@@ -26,8 +26,9 @@ import static java.lang.Thread.yield;
 import static java.util.concurrent.locks.LockSupport.parkNanos;
 
 /**
- * Semaphore Implementation mock class:{@link java.util.concurrent.Semaphore}
+ * Semaphore Implementation
  *
+ * The logic of queue is from BeeCP(https://github.com/Chris2018998/BeeCP)
  * @author Chris.Liao
  */
 public class BeeSemaphore {
@@ -48,8 +49,8 @@ public class BeeSemaphore {
     //Thread Interrupted Exception
     private static final InterruptedException RequestInterruptException = new InterruptedException();
     //state updater
-    private static final AtomicIntegerFieldUpdater<Waiter> updater = AtomicIntegerFieldUpdater
-            .newUpdater(Waiter.class, "state");
+    private static final AtomicIntegerFieldUpdater<Borrower> updater = AtomicIntegerFieldUpdater
+            .newUpdater(Borrower.class, "state");
 
     /**
      * Synchronization implementation for semaphore.
@@ -114,35 +115,29 @@ public class BeeSemaphore {
     private static abstract class Sync {
         protected int size;
         protected AtomicInteger usingSize = new AtomicInteger(0);
-        protected ConcurrentLinkedQueue<Waiter> waiterQueue = new ConcurrentLinkedQueue<Waiter>();
+        protected ConcurrentLinkedQueue<Borrower> borrowerQueue = new ConcurrentLinkedQueue<Borrower>();
 
         public Sync(int size) {
             this.size = size;
         }
 
-        /**
-         * Transfer a permit to a waiter
-         *
-         * @param waiter
-         * @param stsCode
-         * @return true success,false failed
-         */
-        protected static final boolean transferToWaiter(Waiter waiter, int stsCode) {
-            for (int state = waiter.state; (state == STS_NORMAL || state == STS_WAITING); state = waiter.state) {
-                if (updater.compareAndSet(waiter, state, stsCode)) {
-                    if (state == STS_WAITING) LockSupport.unpark(waiter.thread);
+        protected static final boolean transferToWaiter(int newCode, Borrower borrower) {
+            do {
+                int state = borrower.state;
+                if (state != STS_NORMAL && state != STS_WAITING) return false;
+                if (updater.compareAndSet(borrower, state, newCode)) {
+                    if (state == STS_WAITING) LockSupport.unpark(borrower.thread);
                     return true;
                 }
-            }
-            return false;
+            } while (true);
         }
 
         public boolean hasQueuedThreads() {
-            return !waiterQueue.isEmpty();
+            return !borrowerQueue.isEmpty();
         }
 
         public int getQueueLength() {
-            return waiterQueue.size();
+            return borrowerQueue.size();
         }
 
         public int availablePermits() {
@@ -151,12 +146,12 @@ public class BeeSemaphore {
         }
 
         private final boolean acquirePermit() {
-            while (true) {
+            do {
                 int expect = usingSize.get();
                 int update = expect + 1;
                 if (update > size) return false;
                 if (usingSize.compareAndSet(expect, update)) return true;
-            }
+            } while (true);
         }
 
         /**
@@ -168,57 +163,61 @@ public class BeeSemaphore {
         public boolean tryAcquire(long timeout, TimeUnit unit) throws InterruptedException {
             if (acquirePermit()) return true;
 
+            //timeout or interrupted
             boolean isFailed = false;
             boolean isInterrupted = false;
-            Waiter waiter = new Waiter();
-            Thread thread = waiter.thread;
-            waiterQueue.offer(waiter);
-            int spinSize = (waiterQueue.peek() == waiter) ? maxTimedSpins : 0;
+            Borrower borrower = new Borrower();
+            Thread thread = borrower.thread;
+
+            borrowerQueue.offer(borrower);
+            int spinSize = (borrowerQueue.peek() == borrower) ? maxTimedSpins : 0;
             final long deadline = nanoTime() + unit.toNanos(timeout);
 
-            while (true) {
-                int state = waiter.state;
-                if (state == STS_ACQUIRED) {
-                    return true;
-                } else if (state == STS_TRY_ACQUIRE) {
-                    if (acquirePermit()) {
-                        waiterQueue.remove(waiter);
+            do {
+                int state = borrower.state;
+                switch (state) {
+                    case STS_ACQUIRED: {
                         return true;
-                    } else {
-                        state = STS_NORMAL;
-                        waiter.state = state;
-                        yield();
+                    }
+                    case STS_TRY_ACQUIRE: {
+                        if (acquirePermit()) {
+                            borrowerQueue.remove(borrower);
+                            return true;
+                        }
                     }
                 }
 
-                if (isFailed) {
-                    if (waiter.state == state && updater.compareAndSet(waiter, state, STS_FAILED)) {
-                        waiterQueue.remove(waiter);
-                        if (isInterrupted)
-                            throw RequestInterruptException;
-                        else
-                            return false;
+                if (isFailed) {//failed
+                    if (borrower.state == state && updater.compareAndSet(borrower, state, STS_FAILED)) {
+                        borrowerQueue.remove(borrower);
+                        if (isInterrupted) throw RequestInterruptException;
+                        return false;//timeout
                     }
-                } else {
+                } else if (state == STS_TRY_ACQUIRE) {
+                    borrower.state = STS_NORMAL;
+                    yield();
+                } else {//here:(state == STS_NORMAL)
                     timeout = deadline - nanoTime();
                     if (timeout > 0L) {
                         if (spinSize > 0) {
                             --spinSize;
-                        } else if (timeout - parkForTimeoutThreshold > parkForTimeoutThreshold && waiter.state == state && updater.compareAndSet(waiter, state, STS_WAITING)) {
-                            parkNanos(waiter, timeout);
+                        } else if (borrower.state == STS_NORMAL && timeout - parkForTimeoutThreshold > parkForTimeoutThreshold && updater.compareAndSet(borrower, STS_NORMAL, STS_WAITING)) {
+                            parkNanos(timeout);
                             if (thread.isInterrupted()) {
                                 isFailed = true;
                                 isInterrupted = true;
                             }
-                            if (waiter.state == STS_WAITING)//reset to normal
-                                updater.compareAndSet(waiter, STS_WAITING, STS_NORMAL);
+
+                            //reset to normal
+                            if (borrower.state == STS_WAITING) updater.compareAndSet(borrower, STS_WAITING, STS_NORMAL);
                         }
                     } else {//timeout
                         isFailed = true;
                     }
                 }
-            }
+            } while (true);
         }
+
 
         abstract void release();
     }
@@ -229,9 +228,9 @@ public class BeeSemaphore {
         }
 
         public final void release() { //transfer permit
-            Waiter waiter;
-            while ((waiter = waiterQueue.poll()) != null)
-                if (transferToWaiter(waiter, STS_ACQUIRED)) return;
+            Borrower borrower;
+            while ((borrower = borrowerQueue.poll()) != null)
+                if (transferToWaiter(STS_ACQUIRED, borrower)) return;
             usingSize.decrementAndGet();//release permit
         }
     }
@@ -243,15 +242,15 @@ public class BeeSemaphore {
 
         public final void release() {//transfer permit
             usingSize.decrementAndGet();
-            for (Waiter waiter : waiterQueue)
-                if (transferToWaiter(waiter, STS_TRY_ACQUIRE)) return;
+            for (Borrower borrower : borrowerQueue)
+                if (transferToWaiter(STS_TRY_ACQUIRE, borrower)) return;
         }
     }
 
     /**
-     * permit waiter
+     * permit borrower
      */
-    private static final class Waiter {
+    private static final class Borrower {
         volatile int state;
         Thread thread = Thread.currentThread();
     }

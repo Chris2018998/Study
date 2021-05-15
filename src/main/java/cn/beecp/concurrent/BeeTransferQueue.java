@@ -34,48 +34,25 @@ import static java.util.concurrent.locks.LockSupport.parkNanos;
  *
  * @author Chris.Liao
  */
-public final class BeeTransferQueue<E> extends AbstractQueue<E> {
-    /**
-     * Waiter normal status
-     */
+public final class BeeTransferQueue<E> extends ConcurrentLinkedQueue<E> {
+    //Waiter normal status
     private static final State STS_NORMAL = new State();
-    /**
-     * Waiter in waiting status
-     */
+    //Waiter in waiting status
     private static final State STS_WAITING = new State();
-
-    /**
-     * Waiter failed to get element
-     */
-    private static final State STS_FAILED = new State();
-
-    /**
-     * nanoSecond,spin min time value
-     */
+    //Wait timeout or interrupt
+    private static final Object STS_FAILED = new Object();
+    //nanoSecond,spin min time value
     private static final long spinForTimeoutThreshold = 1000L;
-
-    /**
-     * The number of times to spin before blocking in timed waits.
-     */
+    //The number of times to spin before blocking in timed waits.
     private static final int maxTimedSpins = (Runtime.getRuntime().availableProcessors() < 2) ? 0 : 32;
-
-    /**
-     * Thread Interrupted Exception
-     */
+    //Thread Interrupted Exception
     private static final InterruptedException RequestInterruptException = new InterruptedException();
-
-    /**
-     * CAS updater on waiter's state field
-     */
+    //CAS updater on waiter's state field
     private static final AtomicReferenceFieldUpdater<Waiter, Object> TransferUpdater = AtomicReferenceFieldUpdater
             .newUpdater(Waiter.class, Object.class, "state");
-    /**
-     * store element
-     */
+    //store element
     private final ConcurrentLinkedQueue<E> elementQueue = new ConcurrentLinkedQueue<E>();
-    /**
-     * store poll waiter
-     */
+    //store poll waiter
     private final ConcurrentLinkedQueue<Waiter> waiterQueue = new ConcurrentLinkedQueue<Waiter>();
 
     /**
@@ -130,12 +107,13 @@ public final class BeeTransferQueue<E> extends AbstractQueue<E> {
     public boolean tryTransfer(E e) {
         Waiter waiter;
         while ((waiter = waiterQueue.poll()) != null) {
-            for (Object state = waiter.state; (state == STS_NORMAL || state == STS_WAITING); state = waiter.state) {
-                if (TransferUpdater.compareAndSet(waiter, state, e)) {
+            do {
+                Object state = waiter.state;
+                if (state instanceof State && TransferUpdater.compareAndSet(waiter, state, e)) {
                     if (state == STS_WAITING) LockSupport.unpark(waiter.thread);
                     return true;
                 }
-            }
+            } while (true);
         }
         return false;
     }
@@ -166,41 +144,45 @@ public final class BeeTransferQueue<E> extends AbstractQueue<E> {
         E e = elementQueue.poll();
         if (e != null) return e;
 
+        boolean isFailed = false;
         boolean isInterrupted = false;
         Waiter waiter = new Waiter();
+        Thread thread = waiter.thread;
         waiterQueue.offer(waiter);
         int spinSize = (waiterQueue.peek() == waiter) ? maxTimedSpins : 0;
         final long deadline = nanoTime() + unit.toNanos(timeout);
 
-        while (true) {
+        do {
             Object state = waiter.state;
-            if (state == RequestInterruptException)
+            if (state == RequestInterruptException) {
+                waiterQueue.remove(waiter);
                 throw RequestInterruptException;
-            else if (!(state instanceof State))
+            } else if (!(state instanceof State))
                 return (E) state;
 
-            if (isInterrupted) {
-                if (waiter.state == state && TransferUpdater.compareAndSet(waiter, state, RequestInterruptException)) {
+            if (isFailed) {
+                if (TransferUpdater.compareAndSet(waiter, state, STS_FAILED)) {
                     waiterQueue.remove(waiter);
-                    throw RequestInterruptException;
+                    if (isInterrupted) throw RequestInterruptException;
+                    return null;
                 }
             } else {
                 timeout = deadline - nanoTime();
                 if (timeout > 0L) {
                     if (spinSize > 0) {
                         --spinSize;
-                    } else if (timeout - spinForTimeoutThreshold > 0 && waiter.state == state && TransferUpdater.compareAndSet(waiter, state, STS_WAITING)) {
+                    } else if (waiter.state == STS_NORMAL && timeout - spinForTimeoutThreshold > 0 && TransferUpdater.compareAndSet(waiter, STS_NORMAL, STS_WAITING)) {
                         parkNanos(timeout);
                         if (waiter.thread.isInterrupted())
-                            isInterrupted = true;
+                            isFailed = isInterrupted = true;
                         if (waiter.state == STS_WAITING)
-                            TransferUpdater.compareAndSet(waiter, STS_WAITING, isInterrupted ? RequestInterruptException : null);
+                            TransferUpdater.compareAndSet(waiter, STS_WAITING, isInterrupted ? RequestInterruptException : STS_NORMAL);
                     }
-                } else if (waiter.state == state) {//timeout
-                    TransferUpdater.compareAndSet(waiter, state, null);
+                } else {//timeout
+                    isFailed = true;
                 }
             }
-        }//while
+        } while (true);
     }
 
     /**
