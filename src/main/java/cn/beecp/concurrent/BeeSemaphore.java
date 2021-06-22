@@ -128,6 +128,8 @@ public class BeeSemaphore {
                 if (updater.compareAndSet(borrower, state, newCode)) {
                     if (state == STS_WAITING) LockSupport.unpark(borrower.thread);
                     return true;
+                }else{
+                    yield();
                 }
             } while (true);
         }

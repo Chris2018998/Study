@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.concurrent.locks.LockSupport;
 
 import static java.lang.System.nanoTime;
+import static java.lang.Thread.yield;
 import static java.util.concurrent.locks.LockSupport.parkNanos;
 
 /**
@@ -106,12 +107,15 @@ public final class BeeTransferQueue<E> extends ConcurrentLinkedQueue<E> {
      */
     public boolean tryTransfer(E e) {
         Waiter waiter;
-        while ((waiter = waiterQueue.poll()) != null) {
+        W:while ((waiter = waiterQueue.poll()) != null) {
             do {
                 Object state = waiter.state;
-                if (state instanceof State && TransferUpdater.compareAndSet(waiter, state, e)) {
+                if (!(state instanceof State))continue W;
+                if (TransferUpdater.compareAndSet(waiter, state, e)) {
                     if (state == STS_WAITING) LockSupport.unpark(waiter.thread);
                     return true;
+                }else{
+                    yield();
                 }
             } while (true);
         }
